@@ -10,6 +10,7 @@ POST /douyin
   {"action":"search", "query":"猫", "n":10}
   {"action":"read", "url":"https://www.douyin.com/video/...", "n":10}
   {"action":"profile", "url":"https://www.douyin.com/user/...", "n":10}
+  {"action":"user_posts", "sec_uid":"MS4wLjAB...", "n":10}   sec_uid 可省，省了看自己
   {"action":"post", "video_path":"/abs/path/on/this/host.mp4", "caption":"...", "tags":["猫"]}
   {"action":"post_images", "image_paths":["/abs/path/on/this/host.jpg"], "caption":"...", "tags":["猫"]}
 
@@ -328,6 +329,30 @@ def _safe_dy_url(value, kind="any"):
     return raw.replace("http://", "https://", 1)
 
 
+# 抖音的 sec_uid 是一串以 MS4wLjAB 开头的 base64-ish 字符串（实测两个真实
+# 账号分别是 76 和 55 个字符，长度并不固定，所以只卡一个宽松的上下界，不写
+# 死长度）。这里跟 _safe_dy_url() 是同一类安全阀，作用也一样：user_posts 会
+# 拿它去拼 https://www.douyin.com/user/<sec_uid>，不校验的话调用方塞一个
+# "../../xxx" 或者带 ?# 的字符串进来就能把请求拐到别的路径上去，等于把这个
+# 服务变成任意抖音页面抓取器。白名单字符集（字母数字 _ -）本身就排除了 /
+# ? # : 这些能改变 URL 结构的字符，比事后 quote 更直接。
+_SEC_UID_RE = re.compile(r"^MS4wLjAB[A-Za-z0-9_-]{20,200}$")
+
+
+def _safe_sec_uid(value):
+    """校验并返回规整后的 sec_uid，不合法直接抛 ValueError（跟
+    _safe_dy_url() 的错误约定一致，调用方统一转成 {"ok": False, ...}）。"""
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("sec_uid 必须是非空字符串")
+    raw = value.strip()
+    if not _SEC_UID_RE.match(raw):
+        raise ValueError(
+            "sec_uid 格式不对：应该是抖音主页链接 /user/ 后面那一串以 MS4wLjAB "
+            "开头的字符串，不是抖音号、也不是 uid 数字"
+        )
+    return raw
+
+
 _SHORT_LINK_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                   "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36")
 
@@ -466,6 +491,13 @@ def _normalize_aweme(raw):
         "author_url": f"{BASE}/user/{sec_uid}" if sec_uid else None,
         "avatar": _url_list_first(author.get("avatar_thumb") or author.get("avatarThumb")),
         "stats": {
+            # play_count 单独说一句：抖音网页接口对"别人的作品"确实会返回
+            # 这个字段，但拿真实登录态实测过，返回的每一条都是 0——网页端
+            # 根本不下发真实播放量，真实播放数只有创作者本人在
+            # creator.douyin.com 后台看得到。这里照实透传（是 0 就是 0，不
+            # 改写成 None、也不假装拿不到），由调用方自己判断"全是 0 就别
+            # 提播放量"，不要在这一层擅自加工。
+            "plays": stats.get("play_count", stats.get("playCount")),
             "likes": stats.get("digg_count", stats.get("diggCount")),
             "comments": stats.get("comment_count", stats.get("commentCount")),
             "shares": stats.get("share_count", stats.get("shareCount")),
@@ -929,6 +961,205 @@ async def action_profile(page, body):
         "profile": profile,
         "items": videos,
         "count": len(videos),
+    }
+
+
+async def action_user_posts(page, body):
+    """读一个抖音账号的作品列表（只读）。
+
+    跟 action_profile 的区别不在"取的数据"，而在"寻址方式和返回形状"：
+    profile 要求调用方给一条完整的主页 URL（人在聊天里甩链接过来那条路径），
+    这里接的是 sec_uid，且允许不传——不传就看当前登录账号自己的主页
+    (/user/self)。调用方如果是定时/按需地盯着某个固定的号看数据涨没涨，手里
+    天然只有一个 sec_uid、没有链接，
+    每次自己拼一条 URL 再走 profile 属于绕远路，而且 profile 还会顺带装一个
+    browse session（为了"点卡片进详情"那条路径保留页面），对纯取数来说是白
+    占一个常驻标签页。
+
+    返回形状也故意跟 profile 不一样：profile 返回 _normalize_aweme() 那份
+    嵌套结构（stats 是个子 dict），这里摊平成一层、字段名直接对齐调用方要的
+    "aweme_id/发布时间/播放/点赞/评论/分享/链接"，省得每个调用方各写一遍
+    嵌套取值 + 空值兜底。
+
+    ⚠️ plays（播放量）：拿真实登录态实测过，抖音网页接口对别人的作品
+    **恒返回 0**，真实播放量只有创作者本人在 creator.douyin.com 后台
+    看得到。这里照实透传不做修饰，调用方要自己判断"全是 0 就别提播放量"，
+    见 _normalize_aweme() 里 plays 那条注释。
+
+    只读：只做导航 + 滚动加载 + 读接口返回，不点赞、不关注、不评论。
+    """
+    raw_sec_uid = body.get("sec_uid")
+    n = _bounded_int(body.get("n"), 10, MAX_ITEMS)
+
+    # 不传 sec_uid = 看自己的主页。/user/self 是抖音自己的固定别名，登录态下
+    # 会渲染成当前账号的主页，不需要先查出自己的 sec_uid 再拼一次 URL。
+    if raw_sec_uid is None or (isinstance(raw_sec_uid, str) and not raw_sec_uid.strip()):
+        sec_uid = None
+        url = f"{BASE}/user/self"
+    else:
+        try:
+            sec_uid = _safe_sec_uid(raw_sec_uid)
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
+        url = f"{BASE}/user/{sec_uid}"
+
+    collected = []
+    seen = set()
+    author = {}
+
+    def _take_user(payload):
+        """/aweme/v1/web/user/profile/{self,other} 的响应里带作者信息。
+        用接口返回的 nickname/aweme_count，不用 PROFILE_HEADER_EXTRACT_JS 那套
+        DOM 兜底——那个是 action_profile 在没有可靠接口字段时的退路，而这个
+        接口实测字段名稳定（nickname/sec_uid/aweme_count/
+        follower_count 都在 user 下面一层），能拿准的就别去猜 DOM。"""
+        if not isinstance(payload, dict):
+            return
+        user = payload.get("user")
+        if not isinstance(user, dict) or not user.get("sec_uid"):
+            return
+        author.update({
+            "nickname": user.get("nickname") or "",
+            "sec_uid": user.get("sec_uid"),
+            "unique_id": user.get("unique_id") or user.get("short_id") or "",
+            "signature": (user.get("signature") or "").strip(),
+            "aweme_count": user.get("aweme_count"),
+            "follower_count": user.get("follower_count"),
+        })
+
+    # answered 是"作品接口回过话了"这个信号，跟 collected（真的解析出作品）
+    # 是两回事，必须分开——实测踩到的坑：有的号作品全是"私密作品"，
+    # 公开的 aweme_list 是空数组，接口正常 200 回来了，但
+    # _collect_aweme_from_json() 一条都收不到。如果拿 collected 当等待条件，
+    # 这种"号存在、就是没有公开作品"的正常情况会一路死等到超时，报成"抖音改版
+    # 了"这种驴唇不对马嘴的错误。改成等 answered：接口一回话就往下走，到底有
+    # 没有作品交给后面看 collected 判断。
+    answered = []
+
+    def _on_posts(payload):
+        if isinstance(payload, dict) and "aweme_list" in payload:
+            answered.append(True)
+        _collect_aweme_from_json(payload, collected, seen)
+
+    posts_handler = _make_json_capture(
+        page,
+        ("/aweme/v1/web/aweme/post", "/aweme/v2/web/aweme/post", "/web/aweme/post"),
+        _on_posts,
+    )
+    user_handler = _make_json_capture(
+        page,
+        ("/aweme/v1/web/user/profile/",),
+        _take_user,
+    )
+    try:
+        # 强制这一页走真实网络：关掉 HTTP 缓存 + 绕过 service worker。
+        #
+        # 为什么必须加（排查了很久的一个不稳定失败）：这个动作靠
+        # page.on("response") 抓 /aweme/v1/web/aweme/post 的响应体拿数据，而
+        # 抖音站点注册了 service worker（douyin.com/sw.js）。短时间内重复打开
+        # 同一个主页时，作品接口有时会被 SW / HTTP 缓存直接供数、根本不走网络，
+        # 于是 Playwright 这边一个 response 事件都收不到——表现就是"第一次好用、
+        # 隔一会儿再调就卡满 40 秒超时"，而页面上作品其实好好地渲染出来了，
+        # 极具迷惑性（一度以为是选择器失效/抖音改版）。实测确认：只要 response
+        # 事件到了就一定成功，失败清一色是事件没到。
+        #
+        # 这一页是纯取数用的一次性后台页，用完就关，禁掉缓存没有任何副作用，
+        # 代价只是每次都真的请求一次（本来也就是我们想要的：要的是"现在的
+        # 数据"，读到缓存里半小时前的数字反而是错的）。只作用于这一页，不碰
+        # feed/search/read/post 那几条路径。
+        with suppress(Exception):
+            cdp = await page.context.new_cdp_session(page)
+            await cdp.send("Network.setCacheDisabled", {"cacheDisabled": True})
+            await cdp.send("Network.setBypassServiceWorker", {"bypass": True})
+
+        await _goto(page, url)
+
+        # RENDER_DATA 里有时直接就带着首屏那几条作品，先白捡一次，捡到了
+        # 下面 _wait_for_collected() 立刻就能返回，省一轮等待——跟
+        # action_feed()/action_read() 里那两次 RENDER_DATA_EXTRACT_JS 是
+        # 同一个用法。
+        render_data = await page.evaluate(RENDER_DATA_EXTRACT_JS)
+        if render_data:
+            _collect_aweme_from_json(render_data, collected, seen)
+            if collected:
+                # RENDER_DATA 里就带着作品，不用再等接口了——补一个信号，
+                # 免得下面白等 40 秒。
+                answered.append(True)
+
+        # 等一轮 20 秒，没等到作品接口回话就 reload 再等一轮。
+        #
+        # 为什么要重试（跟上面禁缓存那段是同一个毛病的两道防线）：即使禁了缓存
+        # 和 SW，实测仍有大约六分之一的加载收不到 /aweme/v1/web/aweme/post 的
+        # response 事件（页面本身渲染正常，就是事件没到 Playwright 这边）。这种
+        # 失败是"这一次加载"的属性，换一次加载基本就好了——所以与其把单轮等待
+        # 拉长到 40 秒干等（等再久也等不来一个不会发生的事件），不如 20 秒判负、
+        # reload 换一次加载重试，最坏总耗时跟原来的 40 秒一样，但把绝大部分这类
+        # 失败救回来了。冷启动本身实测 5~9 秒，20 秒的单轮预算是够的。
+        error = await _wait_for_collected(page, answered, timeout_ms=20000)
+        if error and error != "EMPTY" and not answered:
+            with suppress(Exception):
+                await page.reload(wait_until="domcontentloaded", timeout=30000)
+            await _raise_if_challenge(page)
+            error = await _wait_for_collected(page, answered, timeout_ms=20000)
+        if error == "EMPTY":
+            # 这个号一条作品都没发过，是正常状态不是失败——照常返回 ok，
+            # items 空列表，调用方自己决定怎么说（"她还没发过作品"）。
+            return {
+                "ok": True, "action": "user_posts", "sec_uid": sec_uid,
+                "author": author, "items": [], "count": 0,
+            }
+        if error:
+            return {"ok": False, "error": error}
+
+        if not collected:
+            # 接口回话了但一条公开作品都没有：这个号没发过作品，或者作品
+            # 全是私密作品。是正常状态不是失败。
+            return {
+                "ok": True, "action": "user_posts", "sec_uid": sec_uid,
+                "author": author, "items": [], "count": 0,
+            }
+
+        await _scroll_to_load_more(page, collected, n)
+    finally:
+        for handler in (posts_handler, user_handler):
+            with suppress(Exception):
+                page.remove_listener("response", handler)
+
+    # 抖音主页默认就是按发布时间倒序的，但 _collect_aweme_from_json() 是
+    # "扫到哪条算哪条"（RENDER_DATA 和接口响应两个来源混在一起），顺序不保证，
+    # 所以这里显式按发布时间重排一次再截断——不然 n=3 有可能截出三条老作品，
+    # 把刚发的那条漏掉，而"最近发了什么"恰恰是调用方最在意的。
+    collected.sort(key=lambda it: it.get("create_time") or 0, reverse=True)
+
+    items = []
+    for it in collected[:n]:
+        stats = it.get("stats") or {}
+        create_time = it.get("create_time")
+        items.append({
+            "aweme_id": it.get("id"),
+            "desc": it.get("desc") or "",
+            "create_time": create_time,
+            "created_at": (
+                datetime.fromtimestamp(create_time, timezone(timedelta(hours=8)))
+                .isoformat(timespec="seconds")
+                if isinstance(create_time, (int, float)) and create_time > 0 else None
+            ),
+            "plays": stats.get("plays"),
+            "likes": stats.get("likes"),
+            "comments": stats.get("comments"),
+            "shares": stats.get("shares"),
+            "collects": stats.get("collects"),
+            "url": it.get("url"),
+            "cover": it.get("cover"),
+        })
+
+    return {
+        "ok": True,
+        "action": "user_posts",
+        "sec_uid": sec_uid,
+        "author": author,
+        "items": items,
+        "count": len(items),
     }
 
 
@@ -1515,6 +1746,7 @@ READ_ACTIONS = {
     "search": action_search,
     "read": action_read,
     "profile": action_profile,
+    "user_posts": action_user_posts,
 }
 WRITE_ACTIONS = {
     "post": action_post,
