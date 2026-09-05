@@ -1089,13 +1089,36 @@ async def _im_settle():
 # 2026-09-05 的真实会话）：
 #   1   系统提示（"你们已互相关注对方"）  content.tips
 #   7   纯文本                            content.text
+#   8   视频分享                          content.itemId / content_title / content_name
 #   15  表情/贴纸                         content.stickers[].display_name
 #   77  视频/图文分享                     content.itemId / content_title / content_name
 #   150 文件分享                          content.name / content.format
-# 没见过的 type 一律归到 unknown，并把 content 原样截一段带出去——宁可让
-# 调用方看到"有一条我不认识的消息"，也不要静默丢掉，那会让骁莫名其妙地
-# 漏掉对方说的话。
-IM_MESSAGE_TYPES = {1: "system", 7: "text", 15: "sticker", 77: "share", 150: "file"}
+#
+# 8 和 77 是**同一种东西的两个 type**：2026-09-05 21:21 / 21:25 那两条真实
+# 分享 dump 出来，content 的字段集跟 77 完全一致（itemId / content_title /
+# content_name / secUID / cover_url 一个不差，77 只多 cover_url_v2 和
+# image_count / image_index 三个图文字段），所以两个 type 共用下面同一个
+# share 分支，不需要各写一遍。差别只在 aweType/awemeType：77 那条是
+# aweType=0 / awemeType=68，8 这两条是 aweType=800 / awemeType=0——看着是
+# 分享入口（从哪儿点的分享）不同，不是内容形态不同。**不要**按 aweType 去
+# 分叉解析，那是个还没摸清的枚举，摸不清的东西不配决定代码走哪条路。
+#
+# 没见过的 type 一律归到 unknown，但不是就此放弃：见下面 unknown 分支，
+# 它会把 content 的结构摊开带出去，并从几个"消息列表预览文案"字段里挑一句
+# 人话当 text。宁可让调用方看到"有一条我不认识的消息、大概在说这个"，也
+# 不要静默丢掉，那会让骁莫名其妙地漏掉对方说的话。
+IM_MESSAGE_TYPES = {1: "system", 7: "text", 8: "share", 15: "sticker", 77: "share", 150: "file"}
+
+# unknown 分支拿来当兜底文案的字段，按这个顺序取第一个非空的。
+# 这几个都是抖音自己给"会话列表预览/推送通知"用的一句话概括，实测：
+#   content_title  8/77 视频分享的标题
+#   description    110 那种 Lynx 互动卡片（"邀请你一起养小火人"）
+#   push_detail    同上，110 的四个文案字段里最短最干净的一个
+#   tips           1 系统提示
+#   name           150 文件名
+# 顺序是"越具体越靠前"。取到什么就让调用方说什么——转述得不够准，也比让
+# 骁对着一条真实存在的消息说"我看不到你发的东西"强得多。
+IM_UNKNOWN_TEXT_FIELDS = ["content_title", "description", "push_detail", "tips", "name"]
 
 
 def _browse_session_alive(session):
@@ -1637,8 +1660,9 @@ IM_MESSAGES_JS = r"""(args) => {
         item.file_name = c.name || '';
         item.file_format = c.format || '';
       } else if (item.kind === 'share') {
-        // 视频/图文分享：itemId 就是 aweme_id，标题和作者昵称消息里本来就
-        // 带着（content_title / content_name），不用再去请求一次详情页。
+        // 视频/图文分享（type 8 和 77 都走这里，见 IM_MESSAGE_TYPES 的注释）：
+        // itemId 就是 aweme_id，标题和作者昵称消息里本来就带着
+        // （content_title / content_name），不用再去请求一次详情页。
         item.aweme_id = String(c.itemId || '');
         item.title = c.content_title || '';
         item.author = c.content_name || '';
@@ -1646,7 +1670,42 @@ IM_MESSAGES_JS = r"""(args) => {
         item.aweme_url = item.aweme_id ? ('https://www.douyin.com/video/' + item.aweme_id) : '';
         item.text = item.title;
       } else {
-        // 不认识的类型：带一段原文出去，方便以后照着补解析。
+        // 不认识的类型。这里带出去的东西有两个用途，别把它们混成一件事：
+        //
+        // (a) 给人看的排查信息 raw_keys / raw_fields。原来只截 content 的
+        //     前 300 个字符，2026-09-05 那次排查证明这不够用：type=110 是
+        //     张 Lynx 动态卡片，content 有 5900 字符，前 300 个全是卡片
+        //     背景图的 CDN URL，真正说人话的 description 在最后面——光看
+        //     日志完全看不出这是什么，最后还是得单独连一次 CDP 才查清楚。
+        //     所以改成把结构摊开：顶层 key 全列出来，标量带短值，对象/数组
+        //     只标类型和内部 key 名。这样日志里一眼就能看出"哦这个 type
+        //     有 itemId 和 content_title"，照着补解析不用再来一轮。
+        //     原始前 300 字符照旧留着（raw_preview），偶尔还是要看字面。
+        //
+        // (b) 给骁看的兜底文案 text。见 IM_UNKNOWN_TEXT_FIELDS。
+        item.raw_keys = Object.keys(c);
+        const fields = {};
+        for (const k of item.raw_keys) {
+          const v = c[k];
+          if (v === null || v === undefined) {
+            fields[k] = null;
+          } else if (Array.isArray(v)) {
+            fields[k] = '[array:' + v.length + ']';
+          } else if (typeof v === 'object') {
+            // 嵌套对象不递归展开：110 那种卡片嵌套能到四五层、展开出来比
+            // 原文还长。只报内部 key 名，够判断"值不值得再挖一层"了。
+            fields[k] = '{' + Object.keys(v).join(',').slice(0, 120) + '}';
+          } else if (typeof v === 'string') {
+            fields[k] = v.length > 120 ? (v.slice(0, 120) + '…<共' + v.length + '字>') : v;
+          } else {
+            fields[k] = v;
+          }
+        }
+        item.raw_fields = fields;
+        for (const k of args.unknownTextFields) {
+          const v = c[k];
+          if (typeof v === 'string' && v.trim()) { item.text = v.trim(); item.text_from = k; break; }
+        }
         item.raw_preview = (typeof m.content === 'string' ? m.content : JSON.stringify(m.content) || '').slice(0, 300);
       }
     }
@@ -1715,7 +1774,11 @@ async def action_im_messages(page, body):
 
     data = await page.evaluate(
         IM_MESSAGES_JS,
-        {"conversationId": conversation_id, "typeNames": {str(k): v for k, v in IM_MESSAGE_TYPES.items()}},
+        {
+            "conversationId": conversation_id,
+            "typeNames": {str(k): v for k, v in IM_MESSAGE_TYPES.items()},
+            "unknownTextFields": IM_UNKNOWN_TEXT_FIELDS,
+        },
     )
     if data.get("err") == "no_conversation":
         return {"ok": False, "error": f"没有这个会话：{conversation_id}（会话 id 变了？先调 im_conversations）"}
@@ -1731,6 +1794,23 @@ async def action_im_messages(page, body):
             datetime.fromtimestamp(ts / 1000, timezone(timedelta(hours=8))).isoformat(timespec="seconds")
             if isinstance(ts, (int, float)) and ts > 0 else None
         )
+
+    # 见过一条不认识的 type 就往 journal 里记一条完整的结构说明。这一行是
+    # 上面 raw_keys/raw_fields 的全部意义所在：不落到日志里，下次还是得
+    # 现连 CDP 现 dump。刷屏不用担心——unknown 本来就该是罕见事件，天天刷
+    # 说明有个 type 早就该接进来了，那正是这条日志想让人看见的。
+    for m in msgs:
+        if m.get("kind") != "unknown":
+            continue
+        print(
+            f"[im] 没见过的消息类型 type={m.get('type')} server_id={m.get('server_id')} "
+            f"at={m.get('created_at')} text_from={m.get('text_from') or '(没取到)'} "
+            f"text={m.get('text') or ''!r}\n"
+            f"[im]   keys={m.get('raw_keys')}\n"
+            f"[im]   fields={json.dumps(m.get('raw_fields') or {}, ensure_ascii=False)}",
+            flush=True,
+        )
+
     return {
         "ok": True, "action": "im_messages",
         "conversation_id": data.get("conversation_id"),
