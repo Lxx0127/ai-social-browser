@@ -6,12 +6,13 @@
 
 不给 agent 一个完整浏览器，只给它 `feed / read / like / reply / post` 这样的动词。每个动作背后是 Playwright 通过 CDP 连一台**常驻的、人工登录好的 Chrome**，复用真实登录态干活，返回结构化 JSON。
 
-两个独立服务，可以只部署其中一个：
+三个独立服务，可以只部署其中一个或几个：
 
 | 服务 | 平台 | 动作 | 端口（示例） |
 |---|---|---|---|
 | `twitter-tool` | x.com | 读 3 个 + 写 5 个 | 8272 |
 | `xiaohongshu-tool` | xiaohongshu.com | 只读 4 个 | 8273 |
+| `douyin-tool` | douyin.com | 读 4 个 + 写 1 个（`post`，发布视频） | 8274 |
 
 那台常驻 Chrome 本体在同仓库的 [`relay/`](../relay/README.md)（服务器上跑 headed Chrome + 远程调试端口，人和工具共用一个浏览器）。本目录就是"接上 relay 之后，agent 能干什么"的答案。
 
@@ -123,6 +124,34 @@ curl -s localhost:8272/twitter -X POST -H 'content-type: application/json' \
 
 安全阀：`read`/`profile` 只接受 `xiaohongshu.com` 主站 URL，不会被当成任意网页抓取器用。
 
+## douyin-tool 动作参考
+
+统一入口 `POST /douyin`。跟 xiaohongshu-tool 起点一样是只读（抖音风控比小红书更激进，同样不做点赞/关注/评论），**但 2026-08-23 加了两个例外：`post`（发布视频）和 `post_images`（发布图文）**——这是在明确知道上面这条风控判断、用户仍要求用专号承担风险的前提下加的，只读边界对互动类写动作依然成立。
+
+### 读动作
+
+| action | 参数 | 说明 |
+|---|---|---|
+| `feed` | `n?`(≤30) | 首页推荐流 |
+| `search` | `query`(≤100字) `n?` | 搜索视频 |
+| `read` | `url` `n?`(评论数≤40) | 视频详情 + 评论 |
+| `profile` | `url` `n?` | 用户主页 + 最近视频 |
+
+`read`/`profile` 的 `url` 支持 App 分享出来的 `v.douyin.com` 短链，会自动展开成主站链接再走原流程（只向短链域名发请求，跳到白名单外域名一律拒绝）。跟 twitter-tool/xiaohongshu-tool 一样，`feed`/`search`/`profile` 拿到的视频如果紧接着被 `read`，会在同一个仍开着的列表页里真实点击卡片进详情，不 `goto` 硬跳；返回结果里的 `navigation` 字段标实际走的是 `feed_card_click` 还是 `direct_url_fallback`。
+
+### 写动作
+
+| action | 参数 | 频率组 |
+|---|---|---|
+| `post` | `video_path` `caption` `tags?` | publish（默认 2 次/小时，比 twitter-tool 更保守——发视频审核更严格） |
+| `post_images` | `image_paths`(1~35张) `caption` `tags?` | publish（跟 `post` 共用同一个频率闸——都算"发布一条作品"，风险量级一样） |
+
+`video_path`/`image_paths` 里的路径必须是 **douyin-tool 这个进程所在宿主机上的绝对路径**——它是 systemd 直接跑在宿主机上的（不在 docker 里），如果调用方自己跑在容器里（常见情况：调用方是一个 docker 部署的项目），传进来的不能是容器内路径，容器和宿主机没有共享通用文件系统。设了 `DY_POST_MEDIA_ROOT` 时，路径必须落在这个目录下（部署脚本默认建了 `/opt/douyin-uploads` 并把它设成这个目录，当"往这里扔文件"的固定约定）。`caption` 必填；`tags` 是可选的字符串数组，会追加成 `#tag` 拼进文案末尾（去重，已经在 caption 里出现的不重复加）。
+
+写动作同样返回三态 outcome（`confirmed`/`failed`/`uncertain`，含义见上面 twitter-tool 一节），`uncertain` 一样禁止自动重试。识别到验证码/风控挑战时返回 `outcome: "challenge"`，且不计入频率闸。
+
+**这两个写动作都没有对着真实登录态跑通过**（写这段代码时没有能实时访问抖音创作者后台的环境）——创作者后台的上传/发布页结构、按钮文案、接口路径关键词，都是根据公开可观察到的一般结构写的最佳猜测；`post_images` 额外多了一步"切到图文 tab"（`_switch_to_image_mode()`），这是整个实现里最不确定的一处。部署后第一件事必须是拿真实登录态各跑一遍 `post`/`post_images` 冒烟测试，大概率第一次跑不通，需要对着真实页面调整选择器（尤其是 `_fill_caption`/`_wait_for_upload_ready`/`_switch_to_image_mode`/`_wait_for_images_ready` 里的定位）。这跟根 README"选择器绑定日期，改版后会以等待超时的形式明确失败，不会静默返回错数据"的原则一致。
+
 ## 配置
 
 全部走环境变量，都有默认值：
@@ -136,8 +165,15 @@ curl -s localhost:8272/twitter -X POST -H 'content-type: application/json' \
 | `TW_BROWSE_TTL_SECONDS` | 180（最小 30） | `feed`/`profile` 留给后续 `read` 点击复用的列表页存活时长 |
 | `XHS_CDP_URL` | `http://127.0.0.1:9333` | 同上，小红书侧 |
 | `XHS_BROWSE_TTL_SECONDS` | 180（最小 30） | 同上，小红书侧 |
+| `DY_CDP_URL` | `http://127.0.0.1:9333` | 同上，抖音侧 |
+| `DY_BROWSE_TTL_SECONDS` | 180（最小 30） | 同上，抖音侧 |
+| `DY_POST_HOURLY_LIMIT` | 2 | `post`/`post_images` 共用的频率闸，1 小时滑动窗口 |
+| `DY_POST_MEDIA_ROOT` | 空（不限制） | 设置后 `post` 的 `video_path`、`post_images` 的 `image_paths` 都必须落在这个目录下 |
+| `DY_POST_MAX_VIDEO_MB` | 4096 | `post` 接受的视频文件大小上限 |
+| `DY_POST_MAX_IMAGE_MB` | 50 | `post_images` 接受的单张图片大小上限 |
+| `DY_STATE_PATH` | `app.py` 同目录 | 抖音侧频率窗口的落盘路径 |
 
-频率闸数值在 `twitter-tool/app.py` 顶部的 `RATE_LIMITS`。
+频率闸数值在 `twitter-tool/app.py` 顶部的 `RATE_LIMITS`，抖音侧在 `douyin-tool/app.py` 同名常量。
 
 ## 踩坑史
 

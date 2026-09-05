@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Watch Relay</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 100%; height: 100%; overflow: hidden; background: #000; }
+
+#screen {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+}
+
+#status {
+  position: fixed; top: 50%; left: 50%;
+  transform: translate(-50%, -50%);
+  color: #666; font-size: 18px; font-family: system-ui;
+  pointer-events: none;
+  z-index: 10;
+}
+#status.hidden { display: none; }
+</style>
+</head>
+<body>
+
+<div id="status">连接中...</div>
+<img id="screen" alt="">
+
+<script>
+const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+const wsPort = location.protocol === 'https:' ? '' : ':8277';
+const WS_URL = location.hash.slice(1) || `${wsProto}//${location.hostname}${wsPort}`;
+
+const screen = document.getElementById('screen');
+const status = document.getElementById('status');
+let ws = null;
+let reconnectTimer = null;
+
+function connect() {
+  status.textContent = '连接中...';
+  status.classList.remove('hidden');
+
+  ws = new WebSocket(WS_URL);
+
+  ws.onopen = () => {
+    status.classList.add('hidden');
+  };
+
+  ws.onmessage = (e) => {
+    const msg = JSON.parse(e.data);
+    if (msg.type === 'frame') {
+      screen.src = 'data:image/jpeg;base64,' + msg.data;
+    }
+  };
+
+  ws.onclose = () => {
+    status.textContent = '已断开，重连中...';
+    status.classList.remove('hidden');
+    reconnectTimer = setTimeout(connect, 2000);
+  };
+
+  ws.onerror = () => ws.close();
+}
+
+connect();
+</script>
+</body>
+</html>

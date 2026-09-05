@@ -40,9 +40,9 @@ LINUX_CHROME_WINDOW_HEIGHT = 960
 PROFILE_DIR = Path(os.environ.get("BROWSER_RELAY_PROFILE", str(Path.home() / ".browser-relay-profile"))).expanduser()
 SCREENCAST_QUALITY = 85
 _PASS = os.environ.get("BROWSER_RELAY_PASS", "")
-# 登录凭证：客户端发 sha256(密码)；会话 cookie 是另一个派生值，由服务器以 HttpOnly 下发，
-# 页面里的 JS 拿不到，也推不回密码哈希。
-AUTH_TOKEN = hashlib.sha256(_PASS.encode()).hexdigest()
+# 登录凭证：客户端直接发明文密码；会话 cookie 是另一个派生值，由服务器以 HttpOnly 下发，
+# 页面里的 JS 拿不到，也推不回密码。
+AUTH_TOKEN = _PASS
 COOKIE_TOKEN = hashlib.sha256(f"relay-cookie-v1:{_PASS}".encode()).hexdigest()
 COOKIE_NAME = "relay_auth"
 COOKIE_MAX_AGE = 30 * 24 * 3600
@@ -384,6 +384,12 @@ class BrowserRelay:
         self._chrome_left_inset = 0
         self._input_origin_x = None
         self._input_origin_y = None
+        # CDP 用这个倍率把 page/viewport 坐标渲染成更清晰的截图（见
+        # Emulation.setDeviceMetricsOverride 的调用点），但真实 X11 屏幕像素
+        # 并没有跟着放大——1 个 page 坐标只对应 1/DEVICE_SCALE_FACTOR 个真实
+        # 像素。_page_to_root / 校准都要按这个倍率换算，否则点击坐标系统性
+        # 偏出实际按钮位置（越靠近视口边缘偏得越多）。
+        self._device_scale_factor = 2
 
     def _next_id(self):
         self._msg_id += 1
@@ -509,7 +515,7 @@ class BrowserRelay:
 
         await self.cdp_call("Emulation.setDeviceMetricsOverride", {
             "width": self.width, "height": self.height,
-            "deviceScaleFactor": 2, "mobile": True,
+            "deviceScaleFactor": self._device_scale_factor, "mobile": True,
         })
 
         await self.cdp_fire("Page.startScreencast", {
@@ -614,7 +620,7 @@ class BrowserRelay:
                 self.width, self.height = effective_width, effective_height
                 await self.cdp_call("Emulation.setDeviceMetricsOverride", {
                     "width": self.width, "height": self.height,
-                    "deviceScaleFactor": 2, "mobile": True,
+                    "deviceScaleFactor": self._device_scale_factor, "mobile": True,
                 })
                 print(f"viewport 已限制到 X11 可触达范围: {self.width}x{self.height}")
             print(
@@ -741,8 +747,15 @@ class BrowserRelay:
         if not point or not point.get("trusted"):
             raise RuntimeError("X11 坐标校准没有收到可信鼠标事件")
 
-        origin_x = round(sample_root_x - window_x - float(point["x"]))
-        origin_y = round(sample_root_y - window_y - float(point["y"]))
+        # 这次测量本身是在已经套了 Emulation.setDeviceMetricsOverride（见
+        # _connect_cdp）的连接上做的，point.x/y 是被放大过的 page 坐标，要
+        # 先按同一个倍率缩回真实像素，origin 才是纯平移量。
+        origin_x = round(
+            sample_root_x - window_x - float(point["x"]) / self._device_scale_factor
+        )
+        origin_y = round(
+            sample_root_y - window_y - float(point["y"]) / self._device_scale_factor
+        )
         if not (0 <= origin_x < window_width and 0 <= origin_y < window_height):
             raise RuntimeError(f"X11 坐标校准结果越界: {origin_x},{origin_y}")
         self._input_origin_x = origin_x
@@ -754,8 +767,11 @@ class BrowserRelay:
         left = max(0, min(int(self._chrome_left_inset or 0), window_width - 1))
         origin_x = int(self._input_origin_x if self._input_origin_x is not None else left)
         origin_y = int(self._input_origin_y if self._input_origin_y is not None else top)
-        max_width = max(1, window_width - origin_x)
-        max_height = max(1, window_height - origin_y)
+        # window_width/height 是真实 X11 像素；width/height 参数是 page/viewport
+        # 坐标（跟 self.width/self.height 同一套单位），两者之间差一个
+        # deviceScaleFactor，clamp 前要换算成同一单位，否则视口会被裁得过小。
+        max_width = max(1, (window_width - origin_x) * self._device_scale_factor)
+        max_height = max(1, (window_height - origin_y) * self._device_scale_factor)
         return (
             max(1, min(int(width), max_width)),
             max(1, min(int(height), max_height)),
@@ -769,8 +785,11 @@ class BrowserRelay:
         origin_y = int(self._input_origin_y if self._input_origin_y is not None else top)
         page_x = max(0.0, min(float(x), float(self.width)))
         page_y = max(0.0, min(float(y), float(self.height)))
-        root_x = window_x + origin_x + round(page_x)
-        root_y = window_y + origin_y + round(page_y)
+        # page_x/page_y 是放大过 deviceScaleFactor 倍的 CSS 坐标，真实 X11
+        # 屏幕上只需要移动这么多分之一的真实像素——不除的话点击点会系统性地
+        # 甩向右下方（离原点越远偏得越多），这正是"点不到按钮"的成因。
+        root_x = window_x + origin_x + round(page_x / self._device_scale_factor)
+        root_y = window_y + origin_y + round(page_y / self._device_scale_factor)
         root_x = max(window_x, min(root_x, window_x + window_width - 1))
         root_y = max(window_y, min(root_y, window_y + window_height - 1))
         return root_x, root_y
@@ -883,7 +902,7 @@ class BrowserRelay:
                 h = max(1, min(int(h), 4096))
             self.width, self.height = w, h
             await self.cdp_call("Emulation.setDeviceMetricsOverride", {
-                "width": w, "height": h, "deviceScaleFactor": 2, "mobile": True,
+                "width": w, "height": h, "deviceScaleFactor": self._device_scale_factor, "mobile": True,
             })
             return json.dumps({"type": "viewport", "width": w, "height": h})
 
